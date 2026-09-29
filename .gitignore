@@ -9,3 +9,6 @@ files/
 playlists/
 
 scripts/webtorrent.js
+
+.idea
+.vscode
