@@ -278,7 +278,7 @@ local function show_menu()
     end
     local menu = {
         type = menu_type,
-        title = '片头片尾设置',
+        title = '跳过片头片尾',
         search_style = 'disabled',
         footnote = '点击时长记录当前位置；使用 − / + 微调 1 秒',
         callback = {mp.get_script_name(), 'menu-action'},
@@ -298,6 +298,15 @@ local function show_menu()
         },
     }
     mp.commandv('script-message-to', 'uosc', menu_is_open() and 'update-menu' or 'open-menu', utils.format_json(menu))
+end
+
+-- 切换片头片尾设置菜单的显示状态。
+local function toggle_settings_menu()
+    if menu_is_open() then
+        mp.commandv('script-message-to', 'uosc', 'close-menu', menu_type)
+    else
+        show_menu()
+    end
 end
 
 hide_prompt = function()
@@ -639,6 +648,7 @@ end
 read_cache()
 
 mp.register_script_message('open-settings', show_menu)
+mp.register_script_message('toggle-settings', toggle_settings_menu)
 mp.register_script_message('menu-action', function(json)
     local event = json and utils.parse_json(json)
     if event and event.type == 'close' then
