@@ -3,7 +3,7 @@ local msg = require('mp.msg')
 local options = require('mp.options')
 local utils = require('mp.utils')
 
-local o = {
+local script_options = {
     mode = 'manual',
     timeout = 20,
     history_path = '~~/files/skip_intro_and_outro_history.json',
@@ -21,14 +21,15 @@ local o = {
     button_text_hover_color = 'FFFFFF',
     button_border_color = 'FFFFFF',
 }
-options.read_options(o, 'skip_intro_and_outro')
-if o.mode ~= 'none' and o.mode ~= 'auto' and o.mode ~= 'manual' then
-    msg.warn('无效的 mode：' .. tostring(o.mode) .. '，已使用 manual')
-    o.mode = 'manual'
+local mode_labels = {none = '关闭', auto = '自动跳过', manual = '手动确认'}
+options.read_options(script_options, 'skip_intro_and_outro')
+if not mode_labels[script_options.mode] then
+    msg.warn('无效的 mode：' .. tostring(script_options.mode) .. '，已使用 manual')
+    script_options.mode = 'manual'
 end
 
 local menu_type = 'skip_intro_and_outro'
-local history_path = mp.command_native({'expand-path', o.history_path})
+local history_path = mp.command_native({'expand-path', script_options.history_path})
 local on_windows = package.config:sub(1, 1) == '\\'
 local windows_api
 if on_windows then
@@ -42,21 +43,21 @@ if on_windows then
     windows_api = {ffi = ffi, kernel32 = ffi.load('kernel32')}
 end
 -- 缓存以本地目录路径为键。
-local cache = {}
+local directory_settings_cache = {}
 local cache_load_failed = false
 local video_extensions = {
     'mp4', 'mkv', 'mov', 'avi', 'webm',
 }
 -- 当前文件路径、所在目录、扩展名及片头片尾的进入状态。
-local current = {path = nil, directory = nil,
+local current_file = {path = nil, directory = nil,
     extension = nil, entered = {intro = false, outro = false}}
 -- 手动跳过按钮的绘制与倒计时状态。
-local prompt = {kind = nil, overlay = nil, timer = nil, deadline = nil, rect = nil,
+local skip_prompt = {kind = nil, overlay = nil, timer = nil, deadline = nil, rect = nil,
     click_bound = false, last_hover = nil, last_progress = nil, last_width = nil, last_height = nil}
 local position_timer = nil
-local menu_pause_before = nil
+local pause_state_before_menu = nil
 local update_position_timer
-local temp_counter = 0
+local cache_write_counter = 0
 
 local function finite_number(value)
     return type(value) == 'number' and value == value and value > -math.huge and value < math.huge
@@ -115,7 +116,7 @@ local function read_cache()
             return
         end
     end
-    cache = parsed
+    directory_settings_cache = parsed
 end
 
 local function replace_file(source, destination)
@@ -141,14 +142,14 @@ local function write_cache()
         mp.osd_message('片头片尾缓存不可用，无法保存设置', 3)
         return false
     end
-    local contents = utils.format_json(cache)
+    local contents = utils.format_json(directory_settings_cache)
     if type(contents) ~= 'string' then
         mp.osd_message('片头片尾设置序列化失败', 3)
         return false
     end
-    temp_counter = temp_counter + 1
+    cache_write_counter = cache_write_counter + 1
     local temp_path = history_path .. '.tmp.' .. tostring(mp.get_time()):gsub('%.', '')
-        .. '.' .. tostring(temp_counter)
+        .. '.' .. tostring(cache_write_counter)
     local file, err = io.open(temp_path, 'wb')
     if not file then
         msg.error('无法写入片头片尾缓存：' .. tostring(err))
@@ -174,11 +175,19 @@ local function write_cache()
 end
 
 local function current_settings()
-    local settings = current.directory and cache[current.directory]
+    local settings = current_file.directory and directory_settings_cache[current_file.directory]
     return type(settings) == 'table' and settings or nil
 end
 
--- nil 表示选择全部受支持的视频扩展名。
+-- 返回当前目录的跳过模式。
+local function current_mode()
+    local settings = current_settings()
+    local mode = settings and settings.mode
+    if mode_labels[mode] then return mode end
+    return script_options.mode
+end
+
+-- nil 表示使用所有受支持的视频扩展名。
 local function selected_extensions()
     local settings = current_settings()
     return settings and type(settings.extensions) == 'table' and settings.extensions or nil
@@ -201,41 +210,43 @@ end
 
 local function extension_is_allowed()
     local selected = selected_extensions()
-    return is_video_extension(current.extension)
-        and (not selected or extension_is_selected(selected, current.extension))
+    return is_video_extension(current_file.extension)
+        and (not selected or extension_is_selected(selected, current_file.extension))
+end
+
+-- 返回当前文件可用的跳过模式。
+local function get_eligible_skip_mode()
+    if not current_file.directory or not extension_is_allowed() then return nil end
+    local mode = current_mode()
+    return mode ~= 'none' and mode or nil
 end
 
 local function extension_summary(selected)
-    if not selected then return '全部' end
+    if not selected then return 'all' end
     local names = {}
     for _, extension in ipairs(video_extensions) do
         if extension_is_selected(selected, extension) then
-            names[#names + 1] = extension:upper()
+            names[#names + 1] = extension
         end
     end
     return #names > 0 and table.concat(names, '、') or '未选择'
 end
 
-local function is_current_directory_enabled()
-    local settings = current_settings()
-    return settings ~= nil and settings.enabled == true
-end
-
--- 修改当前目录的一项设置，保留同目录的其他设置。
-local function set_setting(name, value)
-    if not current.directory then
-        mp.osd_message(current.path and '仅支持本地视频' or '请先打开视频', 2)
+-- 保存当前目录的一项设置，保留同目录的其他设置。
+local function save_directory_setting(name, value)
+    if not current_file.directory then
+        mp.osd_message(current_file.path and '仅支持本地视频' or '请先打开视频', 2)
         return false
     end
-    local previous_settings = cache[current.directory]
+    local previous_settings = directory_settings_cache[current_file.directory]
     local updated_settings = {}
     if type(previous_settings) == 'table' then
         for key, item in pairs(previous_settings) do updated_settings[key] = item end
     end
     updated_settings[name] = value
-    cache[current.directory] = updated_settings
+    directory_settings_cache[current_file.directory] = updated_settings
     if write_cache() then return true end
-    cache[current.directory] = previous_settings
+    directory_settings_cache[current_file.directory] = previous_settings
     return false
 end
 
@@ -247,45 +258,54 @@ local hide_prompt
 
 -- 打开或刷新 uosc 设置菜单，并暂停当前视频。
 local function show_menu()
-    if current.path and not current.directory then
+    if current_file.path and not current_file.directory then
         if menu_is_open() then
             mp.commandv('script-message-to', 'uosc', 'close-menu', menu_type)
         end
         mp.osd_message('仅支持本地视频', 2)
         return
     end
-    if current.path and mp.get_property('path') then
-        if menu_pause_before == nil then
-            menu_pause_before = mp.get_property_native('pause')
+    if current_file.path and mp.get_property('path') then
+        if pause_state_before_menu == nil then
+            pause_state_before_menu = mp.get_property_native('pause')
         end
         mp.set_property_native('pause', true)
     end
     hide_prompt()
     local settings = current_settings() or {}
-    local enabled = is_current_directory_enabled()
+    local mode = current_mode()
     local selected = selected_extensions()
     local extension_items = {
-        {title = '全部', hint = selected and '未选中' or '已选中',
+        {title = 'all', hint = selected and '未选中' or '已选中',
             value = 'extension:all', active = not selected, keep_open = true},
     }
     for _, extension in ipairs(video_extensions) do
         local active = extension_is_selected(selected, extension)
         extension_items[#extension_items + 1] = {
-            title = extension:upper(),
+            title = extension,
             hint = not selected and '由全部包含' or active and '已选中' or '未选中',
             value = 'extension:' .. extension, active = active, keep_open = true,
         }
     end
+    local mode_items = {
+        {title = 'none', hint = mode_labels.none,
+            value = 'mode:none', active = mode == 'none', keep_open = true},
+        {title = 'auto', hint = mode_labels.auto,
+            value = 'mode:auto', active = mode == 'auto', keep_open = true},
+        {title = 'manual', hint = mode_labels.manual,
+            value = 'mode:manual', active = mode == 'manual', keep_open = true},
+    }
     local menu = {
         type = menu_type,
         title = '跳过片头片尾',
         search_style = 'disabled',
-        footnote = '点击时长记录当前位置；使用 − / + 微调 1 秒',
+        footnote = '点击时长记录当前位置；使用加减按钮微调 1 秒',
         callback = {mp.get_script_name(), 'menu-action'},
         items = {
-            {title = '开关', hint = enabled and '已开启' or '已关闭', value = 'toggle', keep_open = true},
+            {id = 'mode', title = '跳过模式', hint = mode,
+                search_style = 'disabled', items = mode_items},
             {id = 'extensions', title = '配置扩展名', hint = extension_summary(selected),
-                footnote = '点击扩展名切换选择；“全部”与手动选择互斥',
+                footnote = '点击扩展名切换选择；“all”与手动选择互斥',
                 search_style = 'disabled', items = extension_items},
             {title = '片头时长', hint = format_time(settings.intro_duration), value = 'intro', keep_open = true,
                 actions_place = 'outside',
@@ -293,8 +313,8 @@ local function show_menu()
                     {name = 'increase', icon = 'add', label = '增加 1 秒'}}},
             {title = '片尾时长', hint = format_time(settings.outro_duration), value = 'outro', keep_open = true,
                 actions_place = 'outside',
-                actions = {{name = 'decrease', icon = 'remove', label = '减少 1 秒'},
-                    {name = 'increase', icon = 'add', label = '增加 1 秒'}}},
+                actions = {{name = 'increase', icon = 'add', label = '增加 1 秒'},
+                    {name = 'decrease', icon = 'remove', label = '减少 1 秒'}}},
         },
     }
     mp.commandv('script-message-to', 'uosc', menu_is_open() and 'update-menu' or 'open-menu', utils.format_json(menu))
@@ -310,25 +330,31 @@ local function toggle_settings_menu()
 end
 
 hide_prompt = function()
-    if not prompt.kind then return end
-    if prompt.timer then
-        prompt.timer:kill()
-        prompt.timer = nil
+    if not skip_prompt.kind then return end
+    if skip_prompt.timer then
+        skip_prompt.timer:kill()
+        skip_prompt.timer = nil
     end
-    prompt.kind = nil
-    prompt.deadline = nil
-    prompt.rect = nil
-    prompt.last_hover = nil
-    prompt.last_progress = nil
-    prompt.last_width = nil
-    prompt.last_height = nil
-    if prompt.overlay then prompt.overlay:remove() end
-    if prompt.click_bound then
+    skip_prompt.kind = nil
+    skip_prompt.deadline = nil
+    skip_prompt.rect = nil
+    skip_prompt.last_hover = nil
+    skip_prompt.last_progress = nil
+    skip_prompt.last_width = nil
+    skip_prompt.last_height = nil
+    if skip_prompt.overlay then skip_prompt.overlay:remove() end
+    if skip_prompt.click_bound then
         mp.remove_key_binding('skip_intro_and_outro-click')
-        prompt.click_bound = false
+        skip_prompt.click_bound = false
     end
     mp.remove_key_binding('skip_intro_and_outro-confirm')
     mp.remove_key_binding('skip_intro_and_outro-cancel')
+end
+
+-- 清除当前片段的确认按钮和进入状态。
+local function clear_skip_attempt()
+    hide_prompt()
+    current_file.entered.intro, current_file.entered.outro = false, false
 end
 
 local confirm_prompt
@@ -340,17 +366,17 @@ end
 
 -- 绘制带倒计时进度的手动跳过按钮。
 local function render_prompt()
-    if not prompt.kind then return end
+    if not skip_prompt.kind then return end
     local dimensions = mp.get_property_native('osd-dimensions')
     local screen_width = dimensions and dimensions.w or 1920
     local screen_height = dimensions and dimensions.h or 1080
     local scale = screen_height / 1080
-    local style = o
+    local style = script_options
     local button_padding_x = style.button_padding_x * scale
     local button_padding_y = style.button_padding_y * scale
     local font_size = style.button_font_size * scale
     local hint_font_size = font_size * 0.9
-    local message = prompt.kind == 'intro' and '跳过片头' or '跳过片尾'
+    local message = skip_prompt.kind == 'intro' and '跳过片头' or '跳过片尾'
     local hint_text = '[y/n]'
     local message_width = 4 * font_size -- 两条文案均为四个汉字。
     local hint_width = #hint_text * hint_font_size * 0.6
@@ -360,38 +386,38 @@ local function render_prompt()
     local margin = style.button_margin * scale
     local button_x = screen_width - button_width - margin
     local button_y = screen_height - button_height - margin - (80 * scale)
-    prompt.rect = {x = button_x, y = button_y, w = button_width, h = button_height}
+    skip_prompt.rect = {x = button_x, y = button_y, w = button_width, h = button_height}
 
     local mouse = mp.get_property_native('mouse-pos')
-    local hover = mouse_inside_button(mouse, prompt.rect)
-    if hover ~= prompt.click_bound then
+    local hover = mouse_inside_button(mouse, skip_prompt.rect)
+    if hover ~= skip_prompt.click_bound then
         if hover then
             mp.add_forced_key_binding('MBTN_LEFT', 'skip_intro_and_outro-click', function()
-                if mouse_inside_button(mp.get_property_native('mouse-pos'), prompt.rect) then
+                if mouse_inside_button(mp.get_property_native('mouse-pos'), skip_prompt.rect) then
                     confirm_prompt()
                 end
             end)
         else
             mp.remove_key_binding('skip_intro_and_outro-click')
         end
-        prompt.click_bound = hover
+        skip_prompt.click_bound = hover
     end
     local text_color = hover and style.button_text_hover_color or style.button_text_color
-    local remaining = o.timeout > 0 and math.max(0, math.ceil(prompt.deadline - mp.get_time())) or 0
+    local remaining = script_options.timeout > 0 and math.max(0, math.ceil(skip_prompt.deadline - mp.get_time())) or 0
     local progress = 0
-    if o.timeout > 0 and remaining > 0 then
-        progress = 1 - remaining / o.timeout
+    if script_options.timeout > 0 and remaining > 0 then
+        progress = 1 - remaining / script_options.timeout
     elseif remaining == 0 then
         progress = 1
     end
     local progress_color = hover and style.button_progress_hover_color or style.button_progress_color
     local remaining_color = hover and style.button_remaining_hover_color or style.button_remaining_color
-    if prompt.last_hover == hover and prompt.last_progress == progress
-        and prompt.last_width == screen_width and prompt.last_height == screen_height then return end
-    prompt.last_hover = hover
-    prompt.last_progress = progress
-    prompt.last_width = screen_width
-    prompt.last_height = screen_height
+    if skip_prompt.last_hover == hover and skip_prompt.last_progress == progress
+        and skip_prompt.last_width == screen_width and skip_prompt.last_height == screen_height then return end
+    skip_prompt.last_hover = hover
+    skip_prompt.last_progress = progress
+    skip_prompt.last_width = screen_width
+    skip_prompt.last_height = screen_height
 
     local ass = assdraw.ass_new()
     ass:new_event()
@@ -444,19 +470,18 @@ local function render_prompt()
     ass:pos(text_x, hint_y)
     ass:append(hint_text)
 
-    if not prompt.overlay then
-        prompt.overlay = mp.create_osd_overlay('ass-events')
-        prompt.overlay.z = 2000
+    if not skip_prompt.overlay then
+        skip_prompt.overlay = mp.create_osd_overlay('ass-events')
+        skip_prompt.overlay.z = 2000
     end
-    prompt.overlay.res_x = screen_width
-    prompt.overlay.res_y = screen_height
-    prompt.overlay.data = ass.text
-    prompt.overlay:update()
+    skip_prompt.overlay.res_x = screen_width
+    skip_prompt.overlay.res_y = screen_height
+    skip_prompt.overlay.data = ass.text
+    skip_prompt.overlay:update()
 end
 
 local function skip_segment(kind)
-    if not is_current_directory_enabled() or not extension_is_allowed()
-        or current.path ~= mp.get_property('path') then return end
+    if not get_eligible_skip_mode() or current_file.path ~= mp.get_property('path') then return end
     local settings = current_settings() or {}
     local video_duration = mp.get_property_number('duration')
     local playback_time = mp.get_property_number('time-pos')
@@ -472,20 +497,20 @@ local function skip_segment(kind)
 end
 
 confirm_prompt = function()
-    local kind = prompt.kind
+    local kind = skip_prompt.kind
     if not kind then return end
     hide_prompt()
     skip_segment(kind)
 end
 
 local function show_prompt(kind)
-    if prompt.kind then return end
-    prompt.kind = kind
-    if o.timeout > 0 then
-        prompt.deadline = mp.get_time() + o.timeout
-        prompt.timer = mp.add_periodic_timer(1, function()
-            if not prompt.kind then return end
-            if mp.get_time() >= prompt.deadline then
+    if skip_prompt.kind then return end
+    skip_prompt.kind = kind
+    if script_options.timeout > 0 then
+        skip_prompt.deadline = mp.get_time() + script_options.timeout
+        skip_prompt.timer = mp.add_periodic_timer(1, function()
+            if not skip_prompt.kind then return end
+            if mp.get_time() >= skip_prompt.deadline then
                 hide_prompt()
             else
                 render_prompt()
@@ -499,9 +524,9 @@ end
 
 -- 检查片头、片尾区间，处理自动跳过或手动确认。
 local function check_skip_position()
-    if not current.directory or not is_current_directory_enabled() or not extension_is_allowed() then
-        hide_prompt()
-        current.entered.intro, current.entered.outro = false, false
+    local mode = get_eligible_skip_mode()
+    if not mode then
+        clear_skip_attempt()
         return
     end
     local playback_time = mp.get_property_number('time-pos')
@@ -519,11 +544,11 @@ local function check_skip_position()
             and (kind == 'intro' and playback_time < segment_duration
                 or kind == 'outro' and playback_time >= video_duration - segment_duration)
         if not inside then
-            current.entered[kind] = false
-            if prompt.kind == kind then hide_prompt() end
-        elseif not current.entered[kind] and not paused then
-            current.entered[kind] = true
-            if o.mode == 'auto' then
+            current_file.entered[kind] = false
+            if skip_prompt.kind == kind then hide_prompt() end
+        elseif not current_file.entered[kind] and not paused then
+            current_file.entered[kind] = true
+            if mode == 'auto' then
                 skip_segment(kind)
             else
                 show_prompt(kind)
@@ -535,8 +560,8 @@ end
 -- 仅在可触发跳过且正在播放时轮询位置。
 update_position_timer = function()
     local should_run = false
-    if o.mode ~= 'none' and current.directory and not mp.get_property_native('pause')
-        and is_current_directory_enabled() and extension_is_allowed() then
+    local mode = get_eligible_skip_mode()
+    if mode and not mp.get_property_native('pause') then
         local duration = mp.get_property_number('duration')
         local settings = current_settings() or {}
         should_run = valid_duration(duration)
@@ -550,25 +575,27 @@ update_position_timer = function()
         check_skip_position()
     else
         if position_timer then position_timer:kill(); position_timer = nil end
-        if not current.directory or not is_current_directory_enabled() or not extension_is_allowed() then
-            hide_prompt()
-            current.entered.intro, current.entered.outro = false, false
-        end
+        if not mode then clear_skip_attempt() end
     end
+end
+
+-- 更新设置菜单和当前文件的跳过状态。
+local function refresh_settings_menu_and_skip_state()
+    current_file.entered.intro, current_file.entered.outro = false, false
+    show_menu()
+    update_position_timer()
 end
 
 local function refresh_current_file()
     local path = mp.get_property('path')
     local directory, extension = identify_local_file(path)
-    if path ~= current.path or directory ~= current.directory
-        or extension ~= current.extension then
-        hide_prompt()
-        current.path = path
-        current.directory = directory
-        current.extension = extension
-        current.entered = {intro = false, outro = false}
+    if path ~= current_file.path or directory ~= current_file.directory
+        or extension ~= current_file.extension then
+        clear_skip_attempt()
+        current_file.path = path
+        current_file.directory = directory
+        current_file.extension = extension
         if menu_is_open() then show_menu() end
-        update_position_timer()
     end
 end
 
@@ -579,9 +606,9 @@ local function update_segment_duration(kind, segment_duration, video_duration)
         mp.osd_message('时长需大于 0 秒且小于视频总时长', 2)
         return
     end
-    if set_setting(kind .. '_duration', segment_duration) then
+    if save_directory_setting(kind .. '_duration', segment_duration) then
         hide_prompt()
-        current.entered[kind] = true
+        current_file.entered[kind] = true
         mp.set_property_native('pause', true)
         local target = kind == 'intro' and segment_duration or video_duration - segment_duration
         mp.commandv('seek', target, 'absolute+exact')
@@ -618,7 +645,7 @@ local function adjust_segment_duration(kind, delta)
     update_segment_duration(kind, previous_duration + delta, video_duration)
 end
 
--- “全部”对应 nil；手动选择对应扩展名数组。
+-- “all”对应 nil；手动选择对应扩展名数组。
 local function update_extension_selection(choice)
     local selected = selected_extensions()
     local updated
@@ -637,11 +664,8 @@ local function update_extension_selection(choice)
             if choices[extension] then updated[#updated + 1] = extension end
         end
     end
-    if set_setting('extensions', updated) then
-        hide_prompt()
-        current.entered = {intro = false, outro = false}
-        show_menu()
-        update_position_timer()
+    if save_directory_setting('extensions', updated) then
+        refresh_settings_menu_and_skip_state()
     end
 end
 
@@ -652,20 +676,19 @@ mp.register_script_message('toggle-settings', toggle_settings_menu)
 mp.register_script_message('menu-action', function(json)
     local event = json and utils.parse_json(json)
     if event and event.type == 'close' then
-        if mp.get_property('path') and menu_pause_before ~= nil then
-            mp.set_property_native('pause', menu_pause_before)
+        if mp.get_property('path') and pause_state_before_menu ~= nil then
+            mp.set_property_native('pause', pause_state_before_menu)
         end
-        menu_pause_before = nil
+        pause_state_before_menu = nil
         update_position_timer()
         return
     end
     if not event or event.type ~= 'activate' or not menu_is_open() then return end
-    if event.value == 'toggle' then
-        if set_setting('enabled', not is_current_directory_enabled()) then
-            hide_prompt()
-            current.entered = {intro = false, outro = false}
-            show_menu()
-            update_position_timer()
+    if type(event.value) == 'string' and not event.action
+        and event.value:match('^mode:') then
+        local selected_mode = event.value:sub(#'mode:' + 1)
+        if mode_labels[selected_mode] and save_directory_setting('mode', selected_mode) then
+            refresh_settings_menu_and_skip_state()
         end
     elseif type(event.value) == 'string' and not event.action
         and event.value:match('^extension:') then
@@ -681,22 +704,15 @@ mp.register_script_message('menu-action', function(json)
     end
 end)
 
-if o.mode == 'manual' then
-    mp.observe_property('mouse-pos', 'native', function()
-        if prompt.kind then render_prompt() end
-    end)
-    mp.observe_property('osd-dimensions', 'native', function()
-        if prompt.kind then render_prompt() end
-    end)
+local function refresh_prompt_overlay()
+    if skip_prompt.kind then render_prompt() end
 end
-mp.observe_property('pause', 'bool', function()
-    update_position_timer()
-end)
-mp.observe_property('duration', 'number', function()
-    update_position_timer()
-end)
+mp.observe_property('mouse-pos', 'native', refresh_prompt_overlay)
+mp.observe_property('osd-dimensions', 'native', refresh_prompt_overlay)
+mp.observe_property('pause', 'bool', update_position_timer)
+mp.observe_property('duration', 'number', update_position_timer)
 mp.observe_property('time-pos', 'number', function()
-    if mp.get_property_native('pause') and current.directory then check_skip_position() end
+    if mp.get_property_native('pause') and current_file.directory then check_skip_position() end
 end)
 mp.register_event('file-loaded', function()
     refresh_current_file()
@@ -705,11 +721,11 @@ end)
 mp.register_event('end-file', function()
     if position_timer then position_timer:kill(); position_timer = nil end
     hide_prompt()
-    current = {path = nil, directory = nil,
+    current_file = {path = nil, directory = nil,
         extension = nil, entered = {intro = false, outro = false}}
     if menu_is_open() then
         show_menu()
     else
-        menu_pause_before = nil
+        pause_state_before_menu = nil
     end
 end)
