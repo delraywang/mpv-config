@@ -70,6 +70,8 @@ local current_idx = 1
 local bookmark_path = nil
 local history_dir = nil
 local normalize_path = nil
+-- 缓存目录哈希及其失败状态。
+local directory_hashes = {}
 
 local wait_msg
 local on_key = false
@@ -153,7 +155,7 @@ end, true)
 function show_message(text, time)
     message_timer:kill()
     message_timer.timeout = time or 1
-    message_overlay.data = text
+    message_overlay.data = "{\\an9}" .. text
     message_overlay:update()
     message_timer:resume()
 end
@@ -217,7 +219,7 @@ local function command_exists(command, ...)
     end
 end
 
--- returns md5 hash of the full path of the current media file
+-- 计算目录路径的 MD5。
 local function hash(path)
     if path == nil then
         msg.debug("something is wrong with the path, can't get full_path, can't hash it")
@@ -261,13 +263,23 @@ local function hash(path)
     local process = mp.command_native(cmd)
 
     if process.status == 0 then
-        local hash = process.stdout:gsub("%s+", "")
-        msg.debug("hash:", hash)
-        return hash
+        local directory_hash = process.stdout:gsub("%s+", "")
+        msg.debug("hash:", directory_hash)
+        return directory_hash
     else
         msg.warn("hash function failed")
         return
     end
+end
+
+-- 返回目录路径的缓存哈希。
+local function get_directory_hash(directory)
+    local directory_hash = directory_hashes[directory]
+    if directory_hash == nil then
+        directory_hash = hash(directory) or false
+        directory_hashes[directory] = directory_hash
+    end
+    return directory_hash
 end
 
 local function get_bookmark_path(dir)
@@ -275,8 +287,8 @@ local function get_bookmark_path(dir)
     local _, name = utils.split_path(fpath)
     local history_name = nil
     if o.hash then
-        history_name = hash(dir)
-        if history_name == nil then
+        history_name = get_directory_hash(dir)
+        if not history_name then
             msg.warn("hash function failed, fallback to dirname")
             history_name = name
         end
@@ -590,6 +602,7 @@ mp.register_event('file-loaded', function()
     else
         directory = nil
     end
+    if o.enabled and o.hash and directory then get_directory_hash(directory) end
     if directory ~= nil and directory ~= dir then
         mp.add_timeout(0.5, record)
     end
